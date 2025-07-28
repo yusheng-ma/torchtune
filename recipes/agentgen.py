@@ -218,12 +218,15 @@ class InferenceRecipe:
 
         # 第一個代理 - 傳入初始問題
         first_response = self.agent1(cfg, custom_generate_next_token, initial_question)
+        if cfg.enable_kv_cache: self._model.reset_caches()
 
         # 第二個代理 - 傳入初始問題和第一個代理的回答
         second_response = self.agent2(cfg, custom_generate_next_token, initial_question, first_response)
+        if cfg.enable_kv_cache: self._model.reset_caches()
 
         # 第三個代理 - 傳入初始問題、第一和第二個代理的回答
         third_response = self.agent3(cfg, custom_generate_next_token, initial_question, first_response, second_response)
+        if cfg.enable_kv_cache: self._model.reset_caches()
 
         # --- 總結者步驟 ---
         final_summary = self.summarizer(cfg, custom_generate_next_token,
