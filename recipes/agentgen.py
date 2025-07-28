@@ -107,26 +107,103 @@ class InferenceRecipe:
         return self._tokenizer({"messages": messages}, inference=True)["tokens"]
 
     @torch.inference_mode()
-    def agentgen(self, cfg: DictConfig):
-        original_prompt_dict = cfg.prompt
+    def _generate_response(self, messages, cfg, custom_generate_next_token, agent_name="Agent"):
+        """通用的響應生成函數"""
+        tokens = self.convert_messages_to_tokens(messages)
+        prompt_tensor = torch.tensor(tokens, dtype=torch.int, device=self._device)
+        
+        t0 = time.perf_counter()
+        generated_tokens, _ = generation.generate(
+            model=self._model,
+            prompt=prompt_tensor,
+            max_generated_tokens=cfg.max_new_tokens,
+            pad_id=self._tokenizer.pad_id,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
+            stop_tokens=self._tokenizer.stop_tokens,
+            compiled_generate_next_token=custom_generate_next_token,
+        )
+        
+        # 提取新生成的部分
+        new_generated_tokens = generated_tokens[:, prompt_tensor.shape[0]:]
+        new_generated_tokens = new_generated_tokens.tolist()
+        response_text = self._tokenizer.decode(new_generated_tokens[0])
+        
+        t = time.perf_counter() - t0
+        
+        logger.info(f"\n--- {agent_name} Response ---")
+        logger.info(response_text)
+        logger.info(f"{agent_name} Time: {t:.02f} sec")
+        
+        return response_text
 
+    @torch.inference_mode()
+    def agent1(self, cfg, custom_generate_next_token, initial_question):
+        """第一個代理：回答初始問題"""
+        # 使用從 cfg.prompt["user"] 讀取的問題
+        messages = [
+            Message(role="user", content=initial_question),
+            Message(role="assistant", content="")
+        ]
+        return self._generate_response(messages, cfg, custom_generate_next_token, "Agent 1")
+
+    @torch.inference_mode() # 添加裝飾器
+    def agent2(self, cfg, custom_generate_next_token, initial_question, first_response):
+        """第二個代理：基於第一個代理的回答進行回應"""
+        # 使用從 cfg.prompt["user"] 讀取的問題
+        user_content = f"{initial_question} This is the response from other thinkers: {first_response} for your reference."
+        messages = [
+            Message(role="user", content=user_content),
+            Message(role="assistant", content="")
+        ]
+        return self._generate_response(messages, cfg, custom_generate_next_token, "Agent 2")
+
+    @torch.inference_mode() # 添加裝飾器
+    def agent3(self, cfg, custom_generate_next_token, initial_question, first_response, second_response):
+        """第三個代理：基於前兩個代理的回答進行回應"""
+        # 使用從 cfg.prompt["user"] 讀取的問題
+        previous_responses = f"{first_response}; {second_response}"
+        user_content = f"{initial_question} These are previous responses for reference: {previous_responses}"
+        messages = [
+            Message(role="user", content=user_content),
+            Message(role="assistant", content="")
+        ]
+        return self._generate_response(messages, cfg, custom_generate_next_token, "Agent 3")
+
+    @torch.inference_mode() # 添加裝飾器
+    def summarizer(self, cfg, custom_generate_next_token, initial_question, first_resp, second_resp, third_resp):
+        """總結者：基於三個代理的回答進行總結"""
+        # 使用從 cfg.prompt["user"] 讀取的問題
+        all_responses = f"{first_resp}; {second_resp}; {third_resp}"
+        user_content = f"{initial_question} Please conclude the answer for this question based on the answers from the three thinkers: {all_responses}"
+        messages = [
+            Message(role="user", content=user_content),
+            Message(role="assistant", content="")
+        ]
+        return self._generate_response(messages, cfg, custom_generate_next_token, "Final Summary")
+
+    @torch.inference_mode()
+    def agentgen(self, cfg: DictConfig):
+        # 處理初始 prompt (如果有的話，例如系統訊息)
+        original_prompt_dict = cfg.prompt
         messages = []
         if "system" in original_prompt_dict and original_prompt_dict["system"] is not None:
             messages.append(Message(role="system", content=original_prompt_dict["system"]))
 
-        initial_user_message = Message(role="user", content=original_prompt_dict["user"])
-        messages.append(initial_user_message)
+        # 從 cfg.prompt["user"] 獲取初始問題
+        initial_question = original_prompt_dict.get("user", "Please provide an answer.") # 提供默認值以防萬一
 
+        # 設置 KV Cache (如果啟用)
         if cfg.enable_kv_cache:
-            # 先建立一個假的初始 prompt tensor 來計算最大長度
-            # 注意：這裡假設初始 prompt 不會太長。如果需要更精確，可以在第一次生成後再調整。
-            # 或者，可以預估一個較大的總長度。
-            dummy_tokens = self.convert_messages_to_tokens(messages)
+            # 為了 KV Cache，我們需要一個粗略的最大長度估計
+            # 這裡假設初始訊息 + 4次生成（3個代理+1個總結者）都不會超過這個長度
+            dummy_tokens = self.convert_messages_to_tokens(messages + [
+                Message(role="user", content=initial_question), # 使用動態問題
+                Message(role="assistant", content="")
+            ])
             dummy_prompt_len = len(dummy_tokens)
-            estimated_max_total_len = dummy_prompt_len + 4 * cfg.max_new_tokens # 粗略估計
-
+            estimated_max_total_len = dummy_prompt_len + 4 * cfg.max_new_tokens
             with self._device:
-                 # 設置足夠大的 cache 以容納所有步驟 (或動態調整)
                 self._model.setup_caches(
                     batch_size=1,
                     dtype=self._dtype,
@@ -134,84 +211,34 @@ class InferenceRecipe:
                 )
 
         custom_generate_next_token = None
-
         # if quantization: i dont care
 
-        # --- 核心代理流程 ---
-        agent_responses = [] # 用來儲存每個代理的回答
-        all_messages_for_summarizer = list(messages) # 為總結者複製一份包含所有歷史的列表
+        # --- 核心代理流程 (使用函數式方法) ---
+        logger.info("================================ Multi-Agent Generation Start ================================")
 
-        for agent_idx in range(3):
-            current_agent_messages = list(messages)
-            for i, resp in enumerate(agent_responses):
-                current_agent_messages.append(Message(role="assistant", content=resp))
+        # 第一個代理 - 傳入初始問題
+        first_response = self.agent1(cfg, custom_generate_next_token, initial_question)
 
-            current_agent_messages.append(Message(role="assistant", content=""))
+        # 第二個代理 - 傳入初始問題和第一個代理的回答
+        second_response = self.agent2(cfg, custom_generate_next_token, initial_question, first_response)
 
-            tokens = self.convert_messages_to_tokens(current_agent_messages)
-            prompt_tensor = torch.tensor(tokens, dtype=torch.int, device=self._device)
-            logger.debug(f"Prompt tensor shape for Agent {agent_idx + 1}: {prompt_tensor.shape}")
-
-            t0 = time.perf_counter()
-            generated_tokens, _ = generation.generate(
-                model=self._model,
-                prompt=prompt_tensor,
-                max_generated_tokens=cfg.max_new_tokens,
-                pad_id=self._tokenizer.pad_id,
-                temperature=cfg.temperature,
-                top_k=cfg.top_k,
-                stop_tokens=self._tokenizer.stop_tokens,
-                compiled_generate_next_token=custom_generate_next_token,
-            )
-            generated_tokens = generated_tokens.tolist()
-            t = time.perf_counter() - t0
-
-            response_text = self._tokenizer.decode(generated_tokens[0])
-            agent_responses.append(response_text)
-            all_messages_for_summarizer.append(Message(role="assistant", content=response_text))
-
-            logger.info(f"\n--- Agent {agent_idx + 1} Response ---")
-            logger.info(response_text)
-            logger.info(f"Agent {agent_idx + 1} Time: {t:.02f} sec")
+        # 第三個代理 - 傳入初始問題、第一和第二個代理的回答
+        third_response = self.agent3(cfg, custom_generate_next_token, initial_question, first_response, second_response)
 
         # --- 總結者步驟 ---
-        # all_messages_for_summarizer 現在已經包含了系統訊息、初始問題、三個代理的回答
-        # 我們可以添加一個特殊的指令給總結者
-        summarizer_instruction = "\n\nPlease provide a concise summary of the above discussion, considering the initial question and all three perspectives."
-        all_messages_for_summarizer.append(Message(role="user", content=summarizer_instruction))
-        # 添加空的 assistant 訊息以啟動總結者的生成
-        all_messages_for_summarizer.append(Message(role="assistant", content=""))
+        final_summary = self.summarizer(cfg, custom_generate_next_token,
+                                       initial_question, # 傳入初始問題
+                                       first_response, second_response, third_response)
 
-        # Tokenize 總結者的 prompt
-        summary_tokens = self.convert_messages_to_tokens(all_messages_for_summarizer)
-        summary_prompt_tensor = torch.tensor(summary_tokens, dtype=torch.int, device=self._device)
-
-        # --- 執行總結者生成 ---
-        t0_summary = time.perf_counter()
-        final_generated_tokens, _ = generation.generate(
-            model=self._model,
-            prompt=summary_prompt_tensor,
-            max_generated_tokens=cfg.max_new_tokens, # 可以為總結者設置不同的 max_new_tokens
-            pad_id=self._tokenizer.pad_id,
-            temperature=cfg.temperature,
-            top_k=cfg.top_k,
-            stop_tokens=self._tokenizer.stop_tokens,
-            compiled_generate_next_token=custom_generate_next_token,
-        )
-        final_generated_tokens = final_generated_tokens.tolist()
-        t_summary = time.perf_counter() - t0_summary
-
-        # 解碼並輸出最終總結
-        final_summary_text = self._tokenizer.decode(final_generated_tokens[0])
-
-        logger.info("\n--- Final Summary ---")
-        logger.info(final_summary_text)
-        logger.info(f"Summary Time: {t_summary:.02f} sec")
-
-        # --- (可選) 輸出性能指標 ---
+        # --- 輸出性能指標 ---
         # 注意：這裡的性能指標會比較複雜，因為涉及多次生成。
         # 可以選擇輸出最後一次生成的時間，或者計算總時間。
         # model_size 計算保持不變
+        # 為了簡化，這裡只計算總結階段的性能指標（作為示例）
+        # 如果需要更詳細的指標，可以在 _generate_response 中返回更多資訊
+
+        # 注意：以下性能計算是示意性的，因為 _generate_response 沒有返回 token 數量
+        # 如果需要準確的 tokens/sec，需要修改 _generate_response 來返回生成的 token 長度
         model_size = sum(
             [
                 p.numel() * p.dtype.itemsize
@@ -220,13 +247,10 @@ class InferenceRecipe:
                 )
             ]
         )
-        # 計算最後一次生成的 tokens/sec (僅供參考)
-        tokens_generated_summary = len(final_generated_tokens[0]) - summary_prompt_tensor.size(0)
-        tokens_sec_summary = tokens_generated_summary / t_summary if t_summary > 0 else 0
-        logger.info(
-            f"(Summary Generation) Time: {t_summary:.02f} sec, Tokens/sec: {tokens_sec_summary:.02f}"
-        )
-        logger.info(f"Bandwidth achieved (estimate): {model_size * tokens_sec_summary / 1e9:.02f} GB/s")
+
+        # 這裡的性能指標僅作為示例，因為我們沒有從 _generate_response 返回詳細的 token 信息
+        # 如果需要，可以在 _generate_response 中返回 (response_text, generation_time, num_tokens_generated)
+        logger.info(f"Model Size: {model_size / 1e9:.02f} GB")
         if self._device.type != "cpu":
             torch_device = utils.get_torch_device_namespace()
             logger.info(
@@ -239,7 +263,6 @@ def main(cfg: DictConfig) -> None:
     config.log_config(recipe_name="InferenceRecipe", cfg=cfg)
     recipe = InferenceRecipe(cfg=cfg)
     recipe.setup(cfg=cfg)
-    logger.info("================================agentgen start================================")
     recipe.agentgen(cfg=cfg)
 
 
