@@ -516,6 +516,14 @@ _ALL_RECIPES = [
         supports_distributed=False,
     ),
     Recipe(
+        name="agentgen",
+        file_path="agentgen.py",
+        configs=[
+            Config(name="generation", file_path="generation.yaml"),
+        ],
+        supports_distributed=False,
+    ),
+    Recipe(
         name="dev/generate_v2",
         file_path="dev/generate_v2.py",
         configs=[
