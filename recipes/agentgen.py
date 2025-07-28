@@ -103,7 +103,7 @@ class InferenceRecipe:
         self,
         messages: list[Message],
     ) -> list[int]:
-        logger.debug(f"convert_messages_to_tokens - Messages: {messages}")
+        # logger.debug(f"convert_messages_to_tokens - Messages: {messages}")
         return self._tokenizer({"messages": messages}, inference=True)["tokens"]
 
     @torch.inference_mode()
@@ -131,11 +131,30 @@ class InferenceRecipe:
         
         t = time.perf_counter() - t0
         
-        logger.info(f"\n--- {agent_name} Response ---")
-        logger.info(response_text)
-        logger.info(f"{agent_name} Time: {t:.02f} sec")
+        model_size = sum(
+            [
+                p.numel() * p.dtype.itemsize
+                for p in itertools.chain(
+                    self._model.parameters(), self._model.buffers()
+                )
+            ]
+        )
+
+        logger.info(f"[{agent_name}] {response_text}")
         
-        return response_text
+        tokens_generated = len(generated_tokens[0]) - prompt_tensor.size(0)
+        tokens_sec = tokens_generated / t
+        logger.info(
+            f"[{agent_name}] Time for inference: {t:.02f} sec total, {tokens_sec:.02f} tokens/sec"
+        )
+        logger.info(f"[{agent_name}] Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
+        if self._device.type != "cpu":
+            torch_device = utils.get_torch_device_namespace()
+            logger.info(
+                f"[{agent_name}] Memory used: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
+            )
+
+        return response_text, tokens_generated, t
 
     @torch.inference_mode()
     def agent1(self, cfg, custom_generate_next_token, initial_question):
@@ -216,50 +235,42 @@ class InferenceRecipe:
         # --- 核心代理流程 (使用函數式方法) ---
         logger.info("================================ Multi-Agent Generation Start ================================")
 
+        results = []
         # 第一個代理 - 傳入初始問題
-        first_response = self.agent1(cfg, custom_generate_next_token, initial_question)
+        first_response, tokens_gen, t = self.agent1(cfg, custom_generate_next_token, initial_question)
+        results.append({"agent": "Agent 1", "tokens": tokens_gen, "time": t, "response": first_response})
         if cfg.enable_kv_cache: self._model.reset_caches()
 
         # 第二個代理 - 傳入初始問題和第一個代理的回答
-        second_response = self.agent2(cfg, custom_generate_next_token, initial_question, first_response)
+        second_response, tokens_gen, t = self.agent2(cfg, custom_generate_next_token, initial_question, first_response)
+        results.append({"agent": "Agent 2", "tokens": tokens_gen, "time": t, "response": second_response})
         if cfg.enable_kv_cache: self._model.reset_caches()
 
         # 第三個代理 - 傳入初始問題、第一和第二個代理的回答
-        third_response = self.agent3(cfg, custom_generate_next_token, initial_question, first_response, second_response)
+        third_response, tokens_gen, t = self.agent3(cfg, custom_generate_next_token, initial_question, first_response, second_response)
+        results.append({"agent": "Agent 3", "tokens": tokens_gen, "time": t, "response": third_response})
         if cfg.enable_kv_cache: self._model.reset_caches()
 
         # --- 總結者步驟 ---
-        final_summary = self.summarizer(cfg, custom_generate_next_token,
+        final_summary, tokens_gen, t = self.summarizer(cfg, custom_generate_next_token,
                                        initial_question, # 傳入初始問題
                                        first_response, second_response, third_response)
+        results.append({"agent": "Final Summary", "tokens": tokens_gen, "time": t, "response": final_summary})
 
-        # --- 輸出性能指標 ---
-        # 注意：這裡的性能指標會比較複雜，因為涉及多次生成。
-        # 可以選擇輸出最後一次生成的時間，或者計算總時間。
-        # model_size 計算保持不變
-        # 為了簡化，這裡只計算總結階段的性能指標（作為示例）
-        # 如果需要更詳細的指標，可以在 _generate_response 中返回更多資訊
+        total_time = sum(r["time"] for r in results)
+        total_tokens = sum(r["tokens"] for r in results)
+        avg_time_per_step = total_time / len(results)
+        overall_tps = total_tokens / total_time
 
-        # 注意：以下性能計算是示意性的，因為 _generate_response 沒有返回 token 數量
-        # 如果需要準確的 tokens/sec，需要修改 _generate_response 來返回生成的 token 長度
-        model_size = sum(
-            [
-                p.numel() * p.dtype.itemsize
-                for p in itertools.chain(
-                    self._model.parameters(), self._model.buffers()
-                )
-            ]
+        logger.info("================================ Multi-Agent Generation Summary ================================")
+        for r in results:
+            tps = r["tokens"] / r["time"] if r["time"] > 0 else 0
+            logger.info(f"[{r['agent']}] Tokens: {r['tokens']}, Time: {r['time']:.02f}s, Speed: {tps:.02f} t/s")
+
+        logger.info(
+            f"[Overall] Total tokens: {total_tokens}, Total time: {total_time:.02f}s, "
+            f"Overall speed: {overall_tps:.02f} tokens/sec"
         )
-
-        # 這裡的性能指標僅作為示例，因為我們沒有從 _generate_response 返回詳細的 token 信息
-        # 如果需要，可以在 _generate_response 中返回 (response_text, generation_time, num_tokens_generated)
-        logger.info(f"Model Size: {model_size / 1e9:.02f} GB")
-        if self._device.type != "cpu":
-            torch_device = utils.get_torch_device_namespace()
-            logger.info(
-                f"Peak Memory used: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
-            )
-
 
 @config.parse
 def main(cfg: DictConfig) -> None:
