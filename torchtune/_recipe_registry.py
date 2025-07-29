@@ -621,6 +621,54 @@ _ALL_RECIPES = [
         supports_distributed=False,
     ),
     Recipe(
+        name="agenteval",
+        file_path="agenteval.py",
+        configs=[
+            Config(name="eleuther_evaluation", file_path="eleuther_evaluation.yaml"),
+            Config(
+                name="llama3_2_vision/11B_evaluation",
+                file_path="llama3_2_vision/11B_evaluation.yaml",
+            ),
+            Config(
+                name="qwen2/evaluation",
+                file_path="qwen2/evaluation.yaml",
+            ),
+            Config(
+                name="qwen2_5/evaluation",
+                file_path="qwen2_5/evaluation.yaml",
+            ),
+            Config(
+                name="gemma/evaluation",
+                file_path="gemma/evaluation.yaml",
+            ),
+            Config(
+                name="phi4/evaluation",
+                file_path="phi4/evaluation.yaml",
+            ),
+            Config(
+                name="phi3/evaluation",
+                file_path="phi3/evaluation.yaml",
+            ),
+            Config(
+                name="mistral/evaluation",
+                file_path="mistral/evaluation.yaml",
+            ),
+            Config(
+                name="llama3_2/evaluation",
+                file_path="llama3_2/evaluation.yaml",
+            ),
+            Config(
+                name="qwen3/evaluation",
+                file_path="qwen3/evaluation.yaml",
+            ),
+            Config(
+                name="llama3_1/evaluation",
+                file_path="llama3_1/evaluation.yaml",
+            ),
+        ],
+        supports_distributed=False,
+    ),
+    Recipe(
         name="quantize",
         file_path="quantize.py",
         configs=[
