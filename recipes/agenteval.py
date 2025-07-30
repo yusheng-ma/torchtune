@@ -4,6 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+os.environ["HF_ALLOW_CODE_EVAL"] = "1"
+
 import sys
 import time
 
@@ -526,7 +529,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             output,
             output_file="agenteval_detailed.json",
             md_output_file="agenteval_report.md",
-            mode="loglikelihood"
+            mode="generation"
         )
 
         # 顯示前 5 筆
@@ -553,7 +556,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             apply_chat_template=self.apply_chat_template,
             limit=self.limit,
             write_out=True,
-
+            confirm_run_unsafe_code=True, # humaneval
         )
         t1 = time.time() - t0
 
@@ -565,17 +568,19 @@ class EleutherEvalRecipe(EvalRecipeInterface):
                 f"Max memory allocated: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
             )
 
-        # print(output)
+        print(output)
         df = log_detailed_results(
             output,
             output_file="eval_detailed.json",
             md_output_file="eval_report.md",
-            mode="loglikelihood"
+            mode="generation"
         )
 
         # 顯示前 5 筆
         self.logger.info("\n\n📌 First 5 detailed results:")
-        self.logger.info("\n" + df[["question", "is_correct"]].head(5).to_string(index=False))
+        summary_df = df[["problem_id", "entry_point", "is_correct"]].copy()
+        summary_df["is_correct"] = summary_df["is_correct"].map({True: "✅ Passed", False: "❌ Failed"})
+        self.logger.info("\n" + summary_df.head(5).to_string(index=False))
 
         formatted_output = make_table(output)
         self.logger.info(f"\n\n{formatted_output}\n")
@@ -583,90 +588,76 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
 def log_detailed_results(
     output: Dict[str, Any],
-    output_file: str = "detailed_results.json",
-    md_output_file: str = "detailed_report.md",
-    mode: str = "loglikelihood",  # 或 "generation"
+    output_file: str = "eval_detailed.json",
+    md_output_file: str = "eval_report.md",
+    mode: str = "generation"  # 支援 "generation" 模式，特別用於 code generation
 ) -> pd.DataFrame:
     """
-    從 EleutherAI eval harness 的 output 中提取每一題的詳細結果，
-    包括問題、選項、log likelihood、是否正確，並輸出為 JSON 和美觀 Markdown。
-    支援 loglikelihood 和 future generation mode。
+    從 EleutherAI eval harness 的 output 中提取程式碼生成任務（如 humaneval）的詳細結果。
+    支援 generation 模式，輸出模型生成的程式碼、測試結果、正確與否等資訊。
     """
     records = []
-    prompts_and_responses = []  # 用於 Markdown 的 rich 展示
+    prompts_and_responses = []
 
-    for task_name, task_data in output["samples"].items():
+    for task_name, task_samples in output["samples"].items():
         config = output["configs"][task_name]
         version = output["versions"].get(task_name, "N/A")
 
-        for idx, sample in enumerate(task_data):
+        for idx, sample in enumerate(task_samples):
             doc = sample["doc"]
-            question = doc["question"]
-            choices = doc.get("mc1_targets", {}).get("choices", doc.get("mc2_targets", {}).get("choices", []))
-            labels = doc.get("mc1_targets", {}).get("labels", doc.get("mc2_targets", {}).get("labels", []))
-            true_indices = [i for i, lbl in enumerate(labels) if lbl == 1]
+            prompt = doc["prompt"]           # 包含 typing 和函數 signature
+            entry_point = doc["entry_point"] # 函數名稱
+            test_code = doc["test"]          # 檢查用的測試程式碼
+            canonical_solution = doc.get("canonical_solution", "").strip()
 
-            # === 根據 mode 分支處理 ===
-            if mode == "loglikelihood":
-                try:
-                    pred_log_likelihoods = [resp[0][0] for resp in sample["resps"]]
-                except ValueError: # with my agenteval... only one element tensors can be converted to Python scalars
-                    first_resp = sample["resps"][0]  # 假設所有響應相同
-                    # first_resp 應該是像 [tensor([[ll_A, ll_B, ...]])] 這樣的列表
-                    # 所以 first_resp[0] 是 tensor([[ll_A, ll_B, ...]])
-                    # 我們需要 squeeze 成一維並轉換為 Python list
-                    pred_log_likelihoods_tensor = first_resp[0].squeeze(0)  # 形狀: (num_choices,)
-                    pred_log_likelihoods = pred_log_likelihoods_tensor.tolist() # 轉換為 Python list
-                pred_idx = int(torch.argmax(torch.tensor(pred_log_likelihoods)).item())
-                is_correct = pred_idx in true_indices
-                probs = torch.softmax(torch.tensor(pred_log_likelihoods), dim=0)
-                max_prob = probs[pred_idx].item()
+            # 模型生成的回應（可能有多個，但 repeats=1 所以通常只有一個）
+            generated_code_list = sample["resps"]
+            # filtered_resps 是加上 prompt 後的完整程式碼
+            filtered_code_list = sample["filtered_resps"]
 
-                # 提取 prompt：使用 arguments[0][0]（所有選項共享同一個 prompt）
-                prompt = sample["arguments"][0][0].strip()
-                generated_text = choices[pred_idx]
-                log_likelihoods = {f"choice_{i}": float(ll) for i, ll in enumerate(pred_log_likelihoods)}
+            # 通常只有一個生成結果（repeats=1）
+            generated_code = generated_code_list[0][0].strip() if generated_code_list and generated_code_list[0] else ""
+            full_generated_code = filtered_code_list[0][0].strip() if filtered_code_list and filtered_code_list[0] else ""
 
-            elif mode == "generation":
-                # TODO: 未來實現自由生成的分析
-                # 假設 output 格式會有: sample["generated_text"]
-                raise NotImplementedError("Generation mode not implemented yet. Use mode='loglikelihood'.")
+            # pass@1 結果
+            is_correct = bool(sample.get("pass@1", False))
 
-            else:
-                raise ValueError(f"Unsupported mode: {mode}")
+            # 提取 prompt（不含 docstring 後的空白）
+            prompt_display = prompt.strip()
 
-            # === 準備 JSON 記錄（完整資料）===
+            # === 準備 JSON 記錄 ===
             records.append({
                 "task": task_name,
                 "version": version,
-                "question": question,
-                "choices": choices,
-                "correct_indices": true_indices,
-                "model_predicted_index": pred_idx,
-                "model_predicted_text": choices[pred_idx],
+                "problem_id": doc["task_id"],
+                "prompt": prompt,
+                "entry_point": entry_point,
+                "test_code": test_code,
+                "canonical_solution": canonical_solution,
+                "model_generated_code": generated_code,
+                "full_generated_code": full_generated_code,
                 "is_correct": is_correct,
-                "max_prob": round(max_prob, 4) if mode == "loglikelihood" else None,
-                "log_likelihoods": log_likelihoods if mode == "loglikelihood" else None,
-                "prompt": prompt if mode == "loglikelihood" else None,
-                "generated_text": generated_text if mode == "loglikelihood" else None,
+                "pass_at_1": is_correct,  # 對應 metrics
             })
 
-            # === 準備 Markdown 用的 rich 展示 ===
-            result = "✅ Correct" if is_correct else "❌ Incorrect"
-            short_question = question[:50] + "..." if len(question) > 50 else question
+            # === 準備 Markdown 用資料 ===
+            result = "✅ Passed" if is_correct else "❌ Failed"
+            short_prompt = prompt.split("def ")[-1].split("(")[0] + "()"  # 取函數名作為簡短標題
 
             prompts_and_responses.append({
                 "index": idx,
                 "task": task_name,
-                "short_question": short_question,
+                "short_prompt": short_prompt,
                 "result": result,
-                "prompt": prompt,
-                "predicted_text": choices[pred_idx],
-                "correct_indices": true_indices,
-                "choices": choices,
+                "prompt": prompt_display,
+                "canonical_solution": canonical_solution,
+                "generated_code": generated_code,
+                "full_generated_code": full_generated_code,
+                "test_code": test_code,
+                "is_correct": is_correct,
             })
 
-    # === 保存 JSON ===
+    # === 保存 JSON 詳細結果 ===
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
 
@@ -679,50 +670,63 @@ def log_detailed_results(
     print(f"   - {output_file}")
     print(f"   - {md_output_file}")
     print(f"   Total samples: {len(df)}")
-
+    print(f"   Accuracy (pass@1): {df['is_correct'].mean():.2%}")
     return df
 
+
 def _generate_detailed_markdown_report(data: List[Dict], md_file: str, full_records: List[Dict]):
-    """生成美觀的 Markdown 報告，包含摘要表格和每題詳細 prompt 分析。"""
+    """生成美觀的 Markdown 報告，包含摘要與每題詳細分析（程式碼生成專用）"""
     with open(md_file, "w", encoding="utf-8") as f:
-        f.write("# 📊 Evaluation Detailed Report\n\n")
+        f.write("# 🧑‍💻 Code Generation Evaluation Report\n\n")
 
         # === 摘要統計 ===
         total = len(data)
-        correct = sum(1 for d in data if "✅" in d["result"])
+        correct = sum(1 for d in data if d["is_correct"])
         accuracy = correct / total if total > 0 else 0
-        f.write(f"**Summary**: {correct}/{total} correct ({accuracy:.1%})\n\n")
+        f.write(f"**Overall Accuracy (pass@1)**: {correct}/{total} ({accuracy:.1%})\n\n")
 
-        # === 摘要表格（簡潔）===
-        f.write("## 📈 Summary Table\n\n")
-        f.write("| # | Task | Question | Result |\n")
+        # === 摘要表格 ===
+        f.write("## 📊 Summary Table\n\n")
+        f.write("| # | Task | Function | Result |\n")
         f.write("|---|------|----------|--------|\n")
         for d in data:
-            f.write(f"| {d['index']} | `{d['task']}` | {d['short_question']} | {d['result']} |\n")
+            f.write(f"| {d['index']} | `{d['task']}` | `{d['short_prompt']}` | {d['result']} |\n")
         f.write("\n")
 
-        # === 每題詳細分析 ===
-        f.write("## 🧩 Detailed Analysis\n\n")
+        # === 詳細分析 ===
+        f.write("## 🔍 Detailed Analysis\n\n")
         for d in data:
-            f.write(f"### Question {d['index']} ({d['task']})\n")
+            f.write(f"### Problem {d['index']} - `{d['short_prompt']}`\n\n")
             f.write(f"**Result**: {d['result']}\n\n")
-            f.write("**Question**: " + d["short_question"] + "\n\n")
 
-            # Correct choices
-            correct_choices = [d["choices"][i] for i in d["correct_indices"]]
-            f.write("**Correct Answer(s)**:\n")
-            for c in correct_choices:
-                f.write(f"- ✅ `{c}`\n")
-            f.write("\n")
-
-            # Model prediction
-            f.write(f"**Model Prediction**: `{d['predicted_text']}`\n\n")
-
-            # Prompt (用 collapsible block 收起來)
+            # Prompt
             f.write("<details>\n")
-            f.write("<summary>🔍 Show Prompt</summary>\n\n")
+            f.write("<summary>📌 Show Problem Prompt</summary>\n\n")
+            f.write("```python\n")
+            f.write(d["prompt"].replace("```", "\\`\\`\\`") + "\n")
             f.write("```\n")
-            f.write(d["prompt"].replace("`", "\\`") + "\n")
+            f.write("</details>\n\n")
+
+            # Canonical Solution
+            if d["canonical_solution"]:
+                f.write("<details>\n")
+                f.write("<summary>✅ Show Reference Solution</summary>\n\n")
+                f.write("```python\n")
+                f.write(d["canonical_solution"].replace("```", "\\`\\`\\`") + "\n")
+                f.write("```\n")
+                f.write("</details>\n\n")
+
+            # Generated Code
+            f.write("### 🤖 Model Generated Code\n\n")
+            f.write("```python\n")
+            f.write(d["full_generated_code"].replace("```", "\\`\\`\\`") + "\n")
+            f.write("```\n\n")
+
+            # Test Code
+            f.write("<details>\n")
+            f.write("<summary>🧪 Show Test Cases</summary>\n\n")
+            f.write("```python\n")
+            f.write(d["test_code"].replace("```", "\\`\\`\\`") + "\n")
             f.write("```\n")
             f.write("</details>\n\n")
 
@@ -738,7 +742,7 @@ def recipe_main(cfg: DictConfig) -> None:
     recipe = EleutherEvalRecipe(cfg=cfg)
     recipe.setup(cfg=cfg)
     recipe.evaluate()
-    recipe.agenteval()
+    # recipe.agenteval()
 
 
 if __name__ == "__main__":
