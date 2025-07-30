@@ -413,11 +413,26 @@ class _LLMEvalWrapper(HFLM):
             third_responses = self.agent3(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
             final_summary = self.summarizer(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
-            # === final ===
-            for s, context in zip(final_summary, contexts):
-                res.append(s)
+            # === 構建包含所有代理回應的結果 ===
+            for i, (s, context, first, second, third) in enumerate(zip(
+                final_summary, contexts, first_responses, second_responses, third_responses
+            )):
+                # 創建一個字典來存儲所有回應
+                all_responses = {
+                    "final": s,
+                    "agent1": first,
+                    "agent2": second,
+                    "agent3": third
+                }
+                res.append(s)  # `res` 仍然是最終的摘要，以兼容原接口
 
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
+                # 使用 cache_hook 存儲所有中間結果，key 為 (context, gen_kwargs, "all_responses")
+                # 這樣可以在後續被提取
+                self.cache_hook.add_partial(
+                    "generate_until_all_responses",
+                    (context, gen_kwargs),
+                    all_responses
+                )
                 pbar.update(1)
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
@@ -578,6 +593,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         # print(output)
         df = log_detailed_results(
             output,
+            model_wrapper=self.eleuther_model_wrapper, # 新增此參數
             output_file="eval_detailed.json",
             md_output_file="eval_report.md",
             mode="generation"
@@ -595,42 +611,53 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
 def log_detailed_results(
     output: Dict[str, Any],
+    model_wrapper: _LLMEvalWrapper, # 新增參數：傳入模型包裝器以訪問 cache_hook
     output_file: str = "eval_detailed.json",
     md_output_file: str = "eval_report.md",
-    mode: str = "generation"  # 支援 "generation" 模式，特別用於 code generation
+    mode: str = "generation"
 ) -> pd.DataFrame:
     """
     從 EleutherAI eval harness 的 output 中提取程式碼生成任務（如 humaneval）的詳細結果。
-    支援 generation 模式，輸出模型生成的程式碼、測試結果、正確與否等資訊。
+    支援 generation 模式，輸出模型生成的程式碼、測試結果、正確與否等資訊，並包含多代理的回應。
     """
     records = []
     prompts_and_responses = []
 
+    # 從 cache_hook 中提取所有代理的回應
+    # key 格式為 (context, gen_kwargs)，value 為 { "final": ..., "agent1": ..., "agent2": ..., "agent3": ... }
+    all_responses_dict = {}
+    for partial_key, partial_value in model_wrapper.cache_hook.hook_dict.get("generate_until_all_responses", {}).items():
+        context, gen_kwargs = partial_key
+        all_responses_dict[(context, json.dumps(gen_kwargs, sort_keys=True))] = partial_value
+
     for task_name, task_samples in output["samples"].items():
         config = output["configs"][task_name]
         version = output["versions"].get(task_name, "N/A")
-
         for idx, sample in enumerate(task_samples):
             doc = sample["doc"]
-            prompt = doc["prompt"]           # 包含 typing 和函數 signature
-            entry_point = doc["entry_point"] # 函數名稱
-            test_code = doc["test"]          # 檢查用的測試程式碼
+            prompt = doc["prompt"]
+            entry_point = doc["entry_point"]
+            test_code = doc["test"]
             canonical_solution = doc.get("canonical_solution", "").strip()
 
-            # 模型生成的回應（可能有多個，但 repeats=1 所以通常只有一個）
             generated_code_list = sample["resps"]
-            # filtered_resps 是加上 prompt 後的完整程式碼
             filtered_code_list = sample["filtered_resps"]
 
-            # 通常只有一個生成結果（repeats=1）
             generated_code = generated_code_list[0][0].strip() if generated_code_list and generated_code_list[0] else ""
             full_generated_code = filtered_code_list[0][0].strip() if filtered_code_list and filtered_code_list[0] else ""
-
-            # pass@1 結果
             is_correct = bool(sample.get("pass@1", False))
 
-            # 提取 prompt（不含 docstring 後的空白）
             prompt_display = prompt.strip()
+
+            # === 從字典中查找對應的多代理回應 ===
+            # 注意：gen_kwargs 的順序可能不一致，所以我們用 json.dumps 排序後的字串作為 key
+            gen_kwargs_str = json.dumps(sample["args"][1], sort_keys=True) if len(sample["args"]) > 1 else "{}"
+            responses = all_responses_dict.get((prompt, gen_kwargs_str), {
+                "final": full_generated_code,
+                "agent1": "",
+                "agent2": "",
+                "agent3": ""
+            })
 
             # === 準備 JSON 記錄 ===
             records.append({
@@ -644,12 +671,17 @@ def log_detailed_results(
                 "model_generated_code": generated_code,
                 "full_generated_code": full_generated_code,
                 "is_correct": is_correct,
-                "pass_at_1": is_correct,  # 對應 metrics
+                "pass_at_1": is_correct,
+                # 新增：多代理回應
+                "agent1_response": responses["agent1"],
+                "agent2_response": responses["agent2"],
+                "agent3_response": responses["agent3"],
+                "final_response": responses["final"],
             })
 
             # === 準備 Markdown 用資料 ===
             result = "✅ Passed" if is_correct else "❌ Failed"
-            short_prompt = prompt.split("def ")[-1].split("(")[0] + "()"  # 取函數名作為簡短標題
+            short_prompt = prompt.split("def ")[-1].split("(")[0] + "()"
 
             prompts_and_responses.append({
                 "index": idx,
@@ -662,6 +694,11 @@ def log_detailed_results(
                 "full_generated_code": full_generated_code,
                 "test_code": test_code,
                 "is_correct": is_correct,
+                # 新增：多代理回應
+                "agent1_response": responses["agent1"],
+                "agent2_response": responses["agent2"],
+                "agent3_response": responses["agent3"],
+                "final_response": responses["final"],
             })
 
     # === 保存 JSON 詳細結果 ===
