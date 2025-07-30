@@ -223,6 +223,97 @@ class _LLMEvalWrapper(HFLM):
             )
         return toks[:bsz]
 
+    @torch.inference_mode()
+    def agent1(self, contexts, max_ctx_len, max_gen_toks, until, kwargs):
+        # =================================================================== contexts in ===================================================================
+        # encode, pad, and truncate contexts for this batch
+        context_enc, attn_masks = self.tok_batch_encode(
+            contexts,
+            left_truncate_len=max_ctx_len,
+            truncation=self.truncation,
+        )
+        context_enc = context_enc.to(self.device)
+        attn_masks = attn_masks.to(self.device)
+
+        if "max_length" not in kwargs:
+            kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
+
+        # perform batched generation
+        cont = self._model_generate(
+            context=context_enc,
+            attention_mask=attn_masks,
+            stop=until,
+            **kwargs,
+        )
+
+        cont_toks_list = cont.tolist()
+        # =================================================================== respsone postprocess ===================================================================
+
+        first_responses = []
+        for cont_toks in cont_toks_list:
+            if self.backend == "causal":
+                cont_toks = cont_toks[context_enc.shape[1] :]
+
+            s = self.tok_decode(cont_toks)
+
+            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+            for term in until:
+                if len(term) > 0:
+                    # ignore '' separator,
+                    # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
+                    s = s.split(term)[0]
+            first_responses.append(s)
+        
+        return first_responses
+    
+    @torch.inference_mode()
+    def agent2(self, contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs):
+        second_contexts = [
+            f"Write a solution to the following problem and make sure that it passes the tests. This is the response from other thinkers: {resp} for your reference.\n```python\n{ctx}\n```\n"
+            for ctx, resp in zip(contexts, first_responses)
+        ]
+        print(second_contexts)
+        # =================================================================== contexts in ===================================================================
+        # encode, pad, and truncate contexts for this batch
+        context_enc, attn_masks = self.tok_batch_encode(
+            second_contexts,
+            left_truncate_len=max_ctx_len,
+            truncation=self.truncation,
+        )
+        context_enc = context_enc.to(self.device)
+        attn_masks = attn_masks.to(self.device)
+
+        if "max_length" not in kwargs:
+            kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
+
+        # perform batched generation
+        cont = self._model_generate(
+            context=context_enc,
+            attention_mask=attn_masks,
+            stop=until,
+            **kwargs,
+        )
+
+        cont_toks_list = cont.tolist()
+        # =================================================================== respsone postprocess ===================================================================
+
+        second_responses = []
+        for cont_toks in cont_toks_list:
+            if self.backend == "causal":
+                cont_toks = cont_toks[context_enc.shape[1] :]
+
+            s = self.tok_decode(cont_toks)
+
+            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+            for term in until:
+                if len(term) > 0:
+                    # ignore '' separator,
+                    # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
+                    s = s.split(term)[0]
+            second_responses.append(s)
+
+        return second_responses
+
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
@@ -308,44 +399,21 @@ class _LLMEvalWrapper(HFLM):
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
 
-            # encode, pad, and truncate contexts for this batch
-            context_enc, attn_masks = self.tok_batch_encode(
-                contexts,
-                left_truncate_len=max_ctx_len,
-                truncation=self.truncation,
-            )
-            context_enc = context_enc.to(self.device)
-            attn_masks = attn_masks.to(self.device)
+            for c in contexts:
+                print(c)
+            first_responses = self.agent1(contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
-            if "max_length" not in kwargs:
-                kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
+            for r in first_responses:
+                print(r)
+            second_responses = self.agent2(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
-            # perform batched generation
-            cont = self._model_generate(
-                context=context_enc,
-                attention_mask=attn_masks,
-                stop=until,
-                **kwargs,
-            )
+            for r in second_responses:
+                print(r)
+            # === final ===
+            for resp, context in zip(second_responses, contexts):
+                res.append(resp)
 
-            cont_toks_list = cont.tolist()
-            for cont_toks, context in zip(cont_toks_list, contexts):
-                # discard context + left-padding toks if using causal decoder-only LM
-                if self.backend == "causal":
-                    cont_toks = cont_toks[context_enc.shape[1] :]
-
-                s = self.tok_decode(cont_toks)
-
-                # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-                for term in until:
-                    if len(term) > 0:
-                        # ignore '' separator,
-                        # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
-                        s = s.split(term)[0]
-
-                res.append(s)
-
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), resp)
                 pbar.update(1)
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
