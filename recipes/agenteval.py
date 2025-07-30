@@ -96,7 +96,6 @@ class _LLMEvalWrapper(HFLM):
         self._batch_size = batch_size
         self._dtype = dtype
         self._enable_kv_cache = enable_kv_cache
-        self.agent_responses = []  
 
     @property
     def model(self):
@@ -228,30 +227,29 @@ class _LLMEvalWrapper(HFLM):
     def _generate_responses(
         self, contexts: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
     ) -> List[str]:
-        # print(contexts[0])
-        """通用的生成回應方法，適用於任何 context list"""
-        # encode, pad, and truncate
+        # a. encode, pad, and truncate
         context_enc, attn_masks = self.tok_batch_encode(
             contexts,
             left_truncate_len=max_ctx_len,
             truncation=self.truncation,
         )
+
         context_enc = context_enc.to(self.device)
         attn_masks = attn_masks.to(self.device)
-
         if "max_length" not in kwargs:
             kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
-        # 生成
+        # b. 生成
         cont = self._model_generate(
             context=context_enc,
             attention_mask=attn_masks,
             stop=until,
             **kwargs,
         )
+
         cont_toks_list = cont.tolist()
 
-        # 解碼與後處理
+        # c. 解碼與後處理
         responses = []
         for cont_toks in cont_toks_list:
             if self.backend == "causal":
@@ -262,20 +260,19 @@ class _LLMEvalWrapper(HFLM):
                 if len(term) > 0:
                     s = s.split(term)[0]
             responses.append(s.strip())
+
         return responses
 
     @torch.inference_mode()
     def agent1(
         self, contexts: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
     ) -> List[str]:
-        """第一輪思考：直接對原始問題生成回應"""
         return self._generate_responses(contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     @torch.inference_mode()
     def agent2(
         self, contexts: List[str], first_responses: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
     ) -> List[str]:
-        """第二輪思考：基於第一輪回應重新生成"""
         def _build_agent2_context(original_context: str, first_response: str) -> str:
             return (
                 "Write a solution to the following problem and make sure that it passes the tests. "
@@ -409,30 +406,15 @@ class _LLMEvalWrapper(HFLM):
                 max_ctx_len = self.max_length
 
             print("================================ Multi-Agent Evaluation Start ================================")
+            
             first_responses = self.agent1(contexts, max_ctx_len, max_gen_toks, until, kwargs)
             second_responses = self.agent2(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
             third_responses = self.agent3(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
             final_summary = self.summarizer(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
-            # === 構建包含所有代理回應的結果 ===
-            for i, (s, context, first, second, third) in enumerate(zip(
-                final_summary, contexts, first_responses, second_responses, third_responses
-            )):
-                all_responses = {
-                    "final": s,
-                    "agent1": first,
-                    "agent2": second,
-                    "agent3": third,
-                    "context": context,  # 也存儲 context 以便後續匹配
-                    "gen_kwargs": json.dumps(gen_kwargs, sort_keys=True)  # 存儲 gen_kwargs 的字串形式
-                }
-                self.agent_responses.append(all_responses)  # 直接追加到列表
+            for s, context in zip(final_summary, contexts):
                 res.append(s)
-                self.cache_hook.add_partial(
-                    "generate_until_all_responses",
-                    (context, gen_kwargs),
-                    all_responses
-                )
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
                 pbar.update(1)
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
@@ -589,209 +571,9 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             self.logger.info(
                 f"Max memory allocated: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
             )
-
-        # print(output)
-        df = log_detailed_results(
-            output,
-            model_wrapper=self.eleuther_model_wrapper, # 傳入 wrapper
-            output_file="eval_detailed.json",
-            md_output_file="eval_report.md",
-            mode="generation"
-        )
-
-        # 顯示前 5 筆
-        self.logger.info("\n\n📌 First 5 detailed results:")
-        summary_df = df[["problem_id", "entry_point", "is_correct"]].copy()
-        summary_df["is_correct"] = summary_df["is_correct"].map({True: "✅ Passed", False: "❌ Failed"})
-        self.logger.info("\n" + summary_df.head(5).to_string(index=False))
-
         formatted_output = make_table(output)
         self.logger.info(f"\n\n{formatted_output}\n")
 
-
-def log_detailed_results(
-    output: Dict[str, Any],
-    model_wrapper: _LLMEvalWrapper, # 新增參數：傳入模型包裝器以訪問 cache_hook
-    output_file: str = "eval_detailed.json",
-    md_output_file: str = "eval_report.md",
-    mode: str = "generation"
-) -> pd.DataFrame:
-    """
-    從 EleutherAI eval harness 的 output 中提取程式碼生成任務（如 humaneval）的詳細結果。
-    支援 generation 模式，輸出模型生成的程式碼、測試結果、正確與否等資訊，並包含多代理的回應。
-    """
-    records = []
-    prompts_and_responses = []
-
-    all_agent_responses = model_wrapper.agent_responses
-
-    sample_idx = 0  # 用於遍歷 agent_responses
-    for task_name, task_samples in output["samples"].items():
-        config = output["configs"][task_name]
-        version = output["versions"].get(task_name, "N/A")
-        for idx, sample in enumerate(task_samples):
-            doc = sample["doc"]
-            prompt = doc["prompt"]
-            entry_point = doc["entry_point"]
-            test_code = doc["test"]
-            canonical_solution = doc.get("canonical_solution", "").strip()
-
-            generated_code_list = sample["resps"]
-            filtered_code_list = sample["filtered_resps"]
-
-            generated_code = generated_code_list[0][0].strip() if generated_code_list and generated_code_list[0] else ""
-            full_generated_code = filtered_code_list[0][0].strip() if filtered_code_list and filtered_code_list[0] else ""
-            is_correct = bool(sample.get("pass@1", False))
-
-            prompt_display = prompt.strip()
-
-            # === 從 all_agent_responses 中獲取對應的回應 ===
-            # 方法 1: 直接按索引取（最簡單，前提是順序一致）
-            if sample_idx < len(all_agent_responses):
-                responses = all_agent_responses[sample_idx]
-                # 可以加一個簡單的驗證
-                if responses["context"].strip() != prompt.strip():
-                    print(f"Warning: Context mismatch at index {sample_idx}")
-                    responses = {
-                        "final": full_generated_code,
-                        "agent1": "",
-                        "agent2": "",
-                        "agent3": ""
-                    }
-            else:
-                responses = {
-                    "final": full_generated_code,
-                    "agent1": "",
-                    "agent2": "",
-                    "agent3": ""
-                }
-            sample_idx += 1
-
-            records.append({
-                "task": task_name,
-                "version": version,
-                "problem_id": doc["task_id"],
-                "prompt": prompt,
-                "entry_point": entry_point,
-                "test_code": test_code,
-                "canonical_solution": canonical_solution,
-                "model_generated_code": generated_code,
-                "full_generated_code": full_generated_code,
-                "is_correct": is_correct,
-                "pass_at_1": is_correct,
-                # 新增：多代理回應
-                "agent1_response": responses["agent1"],
-                "agent2_response": responses["agent2"],
-                "agent3_response": responses["agent3"],
-                "final_response": responses["final"],
-            })
-
-            # === 準備 Markdown 用資料 ===
-            result = "✅ Passed" if is_correct else "❌ Failed"
-            short_prompt = prompt.split("def ")[-1].split("(")[0] + "()"
-
-            prompts_and_responses.append({
-                "index": idx,
-                "task": task_name,
-                "short_prompt": short_prompt,
-                "result": result,
-                "prompt": prompt_display,
-                "canonical_solution": canonical_solution,
-                "generated_code": generated_code,
-                "full_generated_code": full_generated_code,
-                "test_code": test_code,
-                "is_correct": is_correct,
-                # 新增：多代理回應
-                "agent1_response": responses["agent1"],
-                "agent2_response": responses["agent2"],
-                "agent3_response": responses["agent3"],
-                "final_response": responses["final"],
-            })
-
-    # === 保存 JSON 詳細結果 ===
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-
-    # === 生成 Markdown 報告 ===
-    _generate_detailed_markdown_report(prompts_and_responses, md_output_file, records)
-
-    # === 返回 DataFrame ===
-    df = pd.DataFrame(records)
-    print(f"\n✅ Detailed results saved to:")
-    print(f"   - {output_file}")
-    print(f"   - {md_output_file}")
-    print(f"   Total samples: {len(df)}")
-    print(f"   Accuracy (pass@1): {df['is_correct'].mean():.2%}")
-    return df
-
-
-def _generate_detailed_markdown_report(data: List[Dict], md_file: str, full_records: List[Dict]):
-    """生成美觀的 Markdown 報告，包含摘要與每題詳細分析（程式碼生成專用），並展示多代理的思維過程。"""
-    with open(md_file, "w", encoding="utf-8") as f:
-        f.write("# 🧑‍💻 Code Generation Evaluation Report\n\n")
-        # === 摘要統計 ===
-        total = len(data)
-        correct = sum(1 for d in data if d["is_correct"])
-        accuracy = correct / total if total > 0 else 0
-        f.write(f"**Overall Accuracy (pass@1)**: {correct}/{total} ({accuracy:.1%})\n\n")
-        # === 摘要表格 ===
-        f.write("## 📊 Summary Table\n\n")
-        f.write("| # | Task | Function | Result |\n")
-        f.write("|---|------|----------|--------|\n")
-        for d in data:
-            f.write(f"| {d['index']} | `{d['task']}` | `{d['short_prompt']}` | {d['result']} |\n")
-        f.write("\n")
-        # === 詳細分析 ===
-        f.write("## 🔍 Detailed Analysis\n\n")
-        for d in data:
-            f.write(f"### Problem {d['index']} - `{d['short_prompt']}`\n")
-            f.write(f"**Result**: {d['result']}\n\n")
-            # Prompt
-            f.write("<details>\n")
-            f.write("<summary>📌 Show Problem Prompt</summary>\n\n")
-            f.write("```python\n")
-            f.write(d["prompt"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            f.write("</details>\n\n")
-            # Canonical Solution
-            if d["canonical_solution"]:
-                f.write("<details>\n")
-                f.write("<summary>✅ Show Reference Solution</summary>\n\n")
-                f.write("```python\n")
-                f.write(d["canonical_solution"].replace("```", "\\`\\`\\`") + "\n")
-                f.write("```\n\n")
-                f.write("</details>\n\n")
-            # === 新增：多代理思維過程 ===
-            f.write("## 🤖 Multi-Agent Reasoning Process\n\n")
-            # Agent 1
-            f.write("### Agent 1: Initial Attempt\n\n")
-            f.write("```python\n")
-            f.write(d["agent1_response"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            # Agent 2
-            f.write("### Agent 2: Refinement with Feedback\n\n")
-            f.write("```python\n")
-            f.write(d["agent2_response"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            # Agent 3
-            f.write("### Agent 3: Further Refinement\n\n")
-            f.write("```python\n")
-            f.write(d["agent3_response"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            # Final Summary
-            f.write("### 🏁 Final Summary & Solution\n\n")
-            f.write("```python\n")
-            f.write(d["final_response"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            # Test Code
-            f.write("<details>\n")
-            f.write("<summary>🧪 Show Test Cases</summary>\n\n")
-            f.write("```python\n")
-            f.write(d["test_code"].replace("```", "\\`\\`\\`") + "\n")
-            f.write("```\n\n")
-            f.write("</details>\n\n")
-            f.write("---\n\n")
-    print(f"✅ Markdown report generated at {md_file}")
 
 @config.parse
 def recipe_main(cfg: DictConfig) -> None:
