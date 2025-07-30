@@ -25,7 +25,7 @@ from lm_eval.evaluator_utils import (
     get_task_list,
 )
 
-from lm_eval.evaluator import evaluate
+from torchtune._my_evaluator import my_evaluate
 from lm_eval.models.hf_vlms import HFMultimodalLM
 from lm_eval.models.huggingface import HFLM
 from lm_eval.tasks import get_task_dict, TaskManager
@@ -120,6 +120,7 @@ class _LLMEvalWrapper(HFLM):
 
     def tok_encode(self, text: str, **kwargs) -> list[int]:
         print("get in tok_encode") # Yes
+        # print(text)
         # Note on add_bos flag: setting to False as this gives better results, for example
         # +1% on truthfulqa_mc2 with a LoRA finetune. lit-gpt also sets this to False,
         # see https://github.com/Lightning-AI/lit-gpt/blob/main/eval/lm_eval_harness.py#L66,
@@ -135,6 +136,7 @@ class _LLMEvalWrapper(HFLM):
         self, text: list[str], left_truncate_len: int = None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         print("get in tok_batch_encode") # No?
+        # print(text)
         tokenized_text = [self.tok_encode(x) for x in text]
 
         # pad left
@@ -335,212 +337,8 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             enable_kv_cache=self.enable_kv_cache,
         )
 
-    def _run_multi_agent_loglikelihood(self, reqs: List, instance_idx_to_task: Dict[int, Any]) -> List[torch.Tensor]:
-        """
-        對一批 loglikelihood 請求執行多智能體協作評估。
-        Args:
-            reqs: List of Instance objects with request_type 'loglikelihood'.
-            instance_idx_to_task: A dictionary mapping instance.idx to its parent Task.
-        Returns:
-            List of torch.Tensor, the log likelihoods for each request.
-        """
-        responses = []
-        print(f"get in _run_multi_agent_loglikelihood, # of reqs: {len(reqs)}") # i guess 4
-        for req in reqs:
-            # 獲取必要的信息
-            doc = req.doc
-            # === 關鍵修正：使用 req.idx 作為鍵 ===
-            task = instance_idx_to_task[req.idx] # 這裡是 idx，不是 index
-            choices = task.doc_to_choice(doc) # 現在 task 是有效的
-
-            # --- 關鍵修改：確保 context_tensor 是 tensor ---
-            # req.args[0] 可能是 str 或 torch.Tensor
-            context_input = req.args[0]
-            if isinstance(context_input, str):
-                # 如果是字符串，用 wrapper 的 tok_encode 將其轉換為 tensor
-                context_tensor = torch.tensor(
-                    self.eleuther_model_wrapper.tok_encode(context_input),
-                    device=self.device
-                ).unsqueeze(0) # 增加 batch 維度
-            elif isinstance(context_input, torch.Tensor):
-                # 如果已經是 tensor，直接使用
-                context_tensor = context_input.to(self.device)
-            else:
-                raise TypeError(f"Unexpected type for context: {type(context_input)}")
-
-            # 現在 context_tensor 肯定是 tensor 了，可以安全解碼
-            context_str = self.eleuther_model_wrapper.tok_decode(context_tensor[0].tolist())
-
-            # --- 智能體 1: Thinker ---
-            thinker_prompt = f"{context_str}\n\nPlease act as a thoughtful expert. Analyze the question and each option carefully. Explain your reasoning step by step for each option, and then give your best prediction (only the letter)."
-            thinker_tensor = self.eleuther_model_wrapper.tok_encode(thinker_prompt)
-            thinker_tensor = torch.tensor([thinker_tensor], device=self.device)
-            with local_kv_cache(self.eleuther_model_wrapper.model, batch_size=1, device=self.device, dtype=self.dtype, decoder_max_seq_len=self.eleuther_model_wrapper.max_length):
-                thinker_output, _ = generate(
-                    self.eleuther_model_wrapper.model,
-                    thinker_tensor,
-                    max_generated_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
-                    pad_id=self.eleuther_model_wrapper._tokenizer.pad_id,
-                    stop_tokens=self.eleuther_model_wrapper._tokenizer.stop_tokens,
-                )
-            thinker_response = self.eleuther_model_wrapper.tok_decode(thinker_output[0].tolist())
-            print("finish agent 1")
-            # --- 智能體 2: Critic ---
-            critic_prompt = f"{context_str}\n\nHere is an analysis from a fellow expert:\n{thinker_response}\n\nPlease act as a critical reviewer. Identify any flaws, biases, or errors in the above analysis. Do you agree with the final prediction? If not, explain why and provide your own reasoning. Then give your own prediction (only the letter)."
-            critic_tensor = self.eleuther_model_wrapper.tok_encode(critic_prompt)
-            critic_tensor = torch.tensor([critic_tensor], device=self.device)
-            with local_kv_cache(self.eleuther_model_wrapper.model, batch_size=1, device=self.device, dtype=self.dtype, decoder_max_seq_len=self.eleuther_model_wrapper.max_length):
-                critic_output, _ = generate(
-                    self.eleuther_model_wrapper.model,
-                    critic_tensor,
-                    max_generated_tokens=self.max_new_tokens,
-                    temperature=self.temperature,
-                    top_k=self.top_k,
-                    pad_id=self.eleuther_model_wrapper._tokenizer.pad_id,
-                    stop_tokens=self.eleuther_model_wrapper._tokenizer.stop_tokens,
-                )
-            critic_response = self.eleuther_model_wrapper.tok_decode(critic_output[0].tolist())
-            print("finish agent 2")
-            # --- 智能體 3: Final Judge ---
-            judge_prompt = f"{context_str}\n\nHere are two expert analyses:\n1. Thinker: {thinker_response}\n2. Critic: {critic_response}\n\nPlease act as the final judge. Synthesize both viewpoints. Which prediction do you find more convincing? Give a final, definitive prediction (only the letter)."
-            judge_tensor = self.eleuther_model_wrapper.tok_encode(judge_prompt)
-            judge_tensor = torch.tensor([judge_tensor], device=self.device)
-            with local_kv_cache(self.eleuther_model_wrapper.model, batch_size=1, device=self.device, dtype=self.dtype, decoder_max_seq_len=self.eleuther_model_wrapper.max_length):
-                judge_output, _ = generate(
-                    self.eleuther_model_wrapper.model,
-                    judge_tensor,
-                    max_generated_tokens=64,
-                    temperature=0.0, # Greedy
-                    pad_id=self.eleuther_model_wrapper._tokenizer.pad_id,
-                    stop_tokens=self.eleuther_model_wrapper._tokenizer.stop_tokens,
-                )
-            judge_prediction = self.eleuther_model_wrapper.tok_decode(judge_output[0].tolist()).strip()
-            print("finish agent 3")
-            # --- 解析最終預測並生成 log likelihoods ---
-            num_choices = len(choices)
-            fake_log_likelihoods = torch.full((1, num_choices), -1000.0, device=self.device)
-            import re
-            match = re.search(r'\b([A-D])\b', judge_prediction)
-            if match:
-                chosen_idx = ord(match.group(1)) - ord('A')
-                if 0 <= chosen_idx < num_choices:
-                    fake_log_likelihoods[0, chosen_idx] = 0.0
-            else:
-                fake_log_likelihoods[0, 0] = 0.0 # 默認
-
-            # 重複以匹配 req.repeats
-            for _ in range(req.repeats):
-                responses.append(fake_log_likelihoods)
-
-        return responses
 
     def agenteval(self) -> None:
-        # === 新的多智能體評估流程 ===
-        task_manager = TaskManager(include_path=self.include_path)
-        task_dict = get_task_dict(self.tasks, task_manager)
-        eval_tasks = get_task_list(task_dict) # 從 evaluator.py 來的
-
-        # 2. Build All Requests (關鍵步驟)
-        requests = defaultdict(list)
-        # === 修正：使用 instance.idx 作為鍵 ===
-        instance_idx_to_task = {}
-        
-        for task_output in eval_tasks:
-            task = task_output.task
-            limit = get_sample_size(task, self.limit)
-            # 這會填充 task.instances
-            task.build_all_requests(
-                limit=limit,
-                rank=0, # 假設單GPU
-                world_size=1,
-                cache_requests=False,
-                rewrite_requests_cache=False,
-                system_instruction=None,
-                apply_chat_template=self.apply_chat_template,
-                fewshot_as_multiturn=False,
-                chat_template=self.eleuther_model_wrapper.apply_chat_template if self.apply_chat_template else None,
-                tokenizer_name="",
-            )
-            # 按 reqtype 分類
-            for instance in task.instances:
-                requests[instance.request_type].append(instance)
-                # === 關鍵修正：使用 instance.idx 作為鍵 ===
-                instance_idx_to_task[instance.idx] = task # 這裡是 idx，不是 index
-
-        # 3. 執行多智能體評估 (模擬 getattr(lm, reqtype)(cloned_reqs))
-        all_responses = {}
-        for reqtype, reqs in requests.items():
-            self.logger.info(f"Running multi-agent {reqtype} evaluation")
-            if reqtype == "loglikelihood":
-                responses = self._run_multi_agent_loglikelihood(reqs, instance_idx_to_task)
-            else:
-                # 對於其他類型（如 generate_until），使用原始模型
-                cloned_reqs = [req for req in reqs for _ in range(req.repeats)]
-                inps = torch.stack([req.args[0] for req in cloned_reqs]) # 假設 args[0] 是 context_tensor
-                outs = self.eleuther_model_wrapper._model_call(inps)
-                responses = [outs[i] for i in range(len(cloned_reqs))]
-            all_responses[reqtype] = responses
-
-        # 4. 將響應填回 instances
-        response_idx = 0
-        for reqtype, reqs in requests.items():
-            for req in reqs:
-                for _ in range(req.repeats):
-                    req.resps.append(all_responses[reqtype][response_idx])
-                    response_idx += 1
-
-        # 5. 後處理和結果聚合 (直接複用 evaluator.py 的代碼)
-        # 這部分可以直接調用 evaluator.py 的 consolidate_results 等函數
-        for task_output in eval_tasks:
-            task = task_output.task
-            task.apply_filters()
-            # ... (process_results, calculate_aggregate_metric 等)
-            # 由於代碼複雜，我們可以先只實現 loglikelihood 的多智能體流程，並手動構建輸出。
-
-        # 6. 構建最終輸出並調用 log_detailed_results
-        # 由於完全複製後處理很複雜，我們可以先手動構建一個簡化的 output 字典
-        output = {
-            "results": {},
-            "configs": {task_output.task_name: task_output.task.config for task_output in eval_tasks},
-            "versions": {task_output.task_name: getattr(task_output.task, "VERSION", "N/A") for task_output in eval_tasks},
-            "samples": {}
-        }
-        # 填充 samples
-        for task_output in eval_tasks:
-            task_name = task_output.task_name
-            output["samples"][task_name] = []
-            instances_by_doc_id = defaultdict(list)
-            for instance in task_output.task.instances:
-                instances_by_doc_id[instance.doc_id].append(instance)
-            for doc_id, instances in instances_by_doc_id.items():
-                instances.sort(key=lambda x: x.idx)
-                sample = {
-                    "doc": instances[0].doc,
-                    "arguments": [req.args for req in instances],
-                    "resps": [req.resps for req in instances],
-                    "filtered_resps": [req.filtered_resps[list(req.filtered_resps.keys())[0]] for req in instances] if instances[0].filtered_resps else [req.resps for req in instances],
-                }
-                output["samples"][task_name].append(sample)
-        print(output)
-        # 調用你已有的日誌函數
-        df = log_detailed_results(
-            output,
-            output_file="agenteval_detailed.json",
-            md_output_file="agenteval_report.md",
-            mode="generation"
-        )
-
-        # 顯示前 5 筆
-        self.logger.info("\n\n📌 First 5 detailed results:")
-        self.logger.info("\n" + df[["question", "is_correct"]].head(5).to_string(index=False))
-
-        formatted_output = make_table(output)
-        self.logger.info(f"\n\n{formatted_output}\n")
-
-
-    def evaluate(self) -> None:
         # Initialize tasks for the harness
         task_manager = TaskManager(include_path=self.include_path)
         task_dict = get_task_dict(self.tasks, task_manager)
@@ -550,7 +348,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         self.logger.info(f"Running evaluation on the following tasks: {self.tasks}")
         self.logger.info(task_dict)
         self.logger.info(self.apply_chat_template)
-        output = evaluate(
+        output = my_evaluate(
             self.eleuther_model_wrapper,
             task_dict,
             apply_chat_template=self.apply_chat_template,
@@ -568,7 +366,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
                 f"Max memory allocated: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
             )
 
-        print(output)
+        # print(output)
         df = log_detailed_results(
             output,
             output_file="eval_detailed.json",
@@ -741,8 +539,7 @@ def recipe_main(cfg: DictConfig) -> None:
     config.log_config(recipe_name="EleutherEvalRecipe", cfg=cfg)
     recipe = EleutherEvalRecipe(cfg=cfg)
     recipe.setup(cfg=cfg)
-    recipe.evaluate()
-    # recipe.agenteval()
+    recipe.agenteval()
 
 
 if __name__ == "__main__":
