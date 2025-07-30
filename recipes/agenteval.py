@@ -126,7 +126,7 @@ class _LLMEvalWrapper(HFLM):
         return self._enable_kv_cache
 
     def tok_encode(self, text: str, **kwargs) -> list[int]:
-        print("get in tok_encode") # Yes
+        # print("get in tok_encode") # Yes
         # print(text)
         # Note on add_bos flag: setting to False as this gives better results, for example
         # +1% on truthfulqa_mc2 with a LoRA finetune. lit-gpt also sets this to False,
@@ -142,7 +142,7 @@ class _LLMEvalWrapper(HFLM):
     def tok_batch_encode(
         self, text: list[str], left_truncate_len: int = None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        print("get in tok_batch_encode") # No?
+        # print("get in tok_batch_encode") # No?
         # print(text)
         tokenized_text = [self.tok_encode(x) for x in text]
 
@@ -161,13 +161,13 @@ class _LLMEvalWrapper(HFLM):
         return x, torch.ones_like(x)  # return 'mask' b/c it's expected by the harness
 
     def tok_decode(self, tokens: Union[list[int], int], **kwargs) -> str:
-        print("get in tok_decode") # No?
+        # print("get in tok_decode") # No?
         if isinstance(tokens, int):
             tokens = [tokens]
         return self._tokenizer.decode(tokens)
 
     def _model_call(self, inps: torch.Tensor, **kwargs) -> torch.Tensor:
-        print("get in _model_call") # Yes
+        # print("get in _model_call") # Yes
         return self._model(inps)
 
     def apply_chat_template(
@@ -186,7 +186,7 @@ class _LLMEvalWrapper(HFLM):
     def _model_generate(
         self, context: torch.Tensor, **generation_kwargs
     ) -> torch.Tensor:
-        print("get in _model_generate") # No? I guess its for gen job!
+        # print("get in _model_generate") # No? I guess its for gen job!
         bsz, seq_len = context.shape
 
         temperature = generation_kwargs.get("temperature", 0.0)
@@ -222,11 +222,13 @@ class _LLMEvalWrapper(HFLM):
                 stop_tokens=self._tokenizer.stop_tokens,
             )
         return toks[:bsz]
-
+    
     @torch.inference_mode()
-    def agent1(self, contexts, max_ctx_len, max_gen_toks, until, kwargs):
-        # =================================================================== contexts in ===================================================================
-        # encode, pad, and truncate contexts for this batch
+    def _generate_responses(
+        self, contexts: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
+    ) -> List[str]:
+        """通用的生成回應方法，適用於任何 context list"""
+        # encode, pad, and truncate
         context_enc, attn_masks = self.tok_batch_encode(
             contexts,
             left_truncate_len=max_ctx_len,
@@ -238,86 +240,57 @@ class _LLMEvalWrapper(HFLM):
         if "max_length" not in kwargs:
             kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
-        # perform batched generation
+        # 生成
         cont = self._model_generate(
             context=context_enc,
             attention_mask=attn_masks,
             stop=until,
             **kwargs,
         )
-
         cont_toks_list = cont.tolist()
-        # =================================================================== respsone postprocess ===================================================================
 
-        first_responses = []
+        # 解碼與後處理
+        responses = []
         for cont_toks in cont_toks_list:
             if self.backend == "causal":
-                cont_toks = cont_toks[context_enc.shape[1] :]
-
+                cont_toks = cont_toks[context_enc.shape[1]:]
             s = self.tok_decode(cont_toks)
-
-            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+            # 使用 stop sequences 截斷
             for term in until:
                 if len(term) > 0:
-                    # ignore '' separator,
-                    # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
                     s = s.split(term)[0]
-            first_responses.append(s)
-        
-        return first_responses
-    
+            responses.append(s.strip())
+        return responses
+
     @torch.inference_mode()
-    def agent2(self, contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs):
+    def agent1(
+        self, contexts: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
+    ) -> List[str]:
+        """第一輪思考：直接對原始問題生成回應"""
+        return self._generate_responses(contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
+    @torch.inference_mode()
+    def agent2(
+        self, contexts: List[str], first_responses: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
+    ) -> List[str]:
+        """第二輪思考：基於第一輪回應重新生成"""
+        def _build_agent2_context(self, original_context: str, first_response: str) -> str:
+            return (
+                "Write a solution to the following problem and make sure that it passes the tests. "
+                "This is the response from other thinkers: {resp} for your reference.\n"
+                "```python\n{ctx}\n```"
+            ).format(resp=first_response, ctx=original_context)
+        
         second_contexts = [
-            f"Write a solution to the following problem and make sure that it passes the tests. This is the response from other thinkers: {resp} for your reference.\n```python\n{ctx}\n```\n"
+            _build_agent2_context(ctx, resp)
             for ctx, resp in zip(contexts, first_responses)
         ]
-        print(second_contexts)
-        # =================================================================== contexts in ===================================================================
-        # encode, pad, and truncate contexts for this batch
-        context_enc, attn_masks = self.tok_batch_encode(
-            second_contexts,
-            left_truncate_len=max_ctx_len,
-            truncation=self.truncation,
-        )
-        context_enc = context_enc.to(self.device)
-        attn_masks = attn_masks.to(self.device)
-
-        if "max_length" not in kwargs:
-            kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
-
-        # perform batched generation
-        cont = self._model_generate(
-            context=context_enc,
-            attention_mask=attn_masks,
-            stop=until,
-            **kwargs,
-        )
-
-        cont_toks_list = cont.tolist()
-        # =================================================================== respsone postprocess ===================================================================
-
-        second_responses = []
-        for cont_toks in cont_toks_list:
-            if self.backend == "causal":
-                cont_toks = cont_toks[context_enc.shape[1] :]
-
-            s = self.tok_decode(cont_toks)
-
-            # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-            for term in until:
-                if len(term) > 0:
-                    # ignore '' separator,
-                    # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
-                    s = s.split(term)[0]
-            second_responses.append(s)
-
-        return second_responses
+        return self._generate_responses(second_contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
-        print("get in generate_until here pls")
+        # print("get in generate_until here pls")
         res = []
 
         def _collate(req: Tuple[str, dict]):
@@ -399,16 +372,9 @@ class _LLMEvalWrapper(HFLM):
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
 
-            for c in contexts:
-                print(c)
             first_responses = self.agent1(contexts, max_ctx_len, max_gen_toks, until, kwargs)
-
-            for r in first_responses:
-                print(r)
             second_responses = self.agent2(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
-            for r in second_responses:
-                print(r)
             # === final ===
             for resp, context in zip(second_responses, contexts):
                 res.append(resp)
