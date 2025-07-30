@@ -227,6 +227,7 @@ class _LLMEvalWrapper(HFLM):
     def _generate_responses(
         self, contexts: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
     ) -> List[str]:
+        print(contexts[0])
         """通用的生成回應方法，適用於任何 context list"""
         # encode, pad, and truncate
         context_enc, attn_masks = self.tok_batch_encode(
@@ -274,11 +275,11 @@ class _LLMEvalWrapper(HFLM):
         self, contexts: List[str], first_responses: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
     ) -> List[str]:
         """第二輪思考：基於第一輪回應重新生成"""
-        def _build_agent2_context(self, original_context: str, first_response: str) -> str:
+        def _build_agent2_context(original_context: str, first_response: str) -> str:
             return (
                 "Write a solution to the following problem and make sure that it passes the tests. "
-                "This is the response from other thinkers: {resp} for your reference.\n"
-                "```python\n{ctx}\n```"
+                "This is the response from other thinkers: ```python\n{resp}\n``` for your reference.\n"
+                "This is the problem: ```python\n{ctx}\n```"
             ).format(resp=first_response, ctx=original_context)
         
         second_contexts = [
@@ -286,6 +287,40 @@ class _LLMEvalWrapper(HFLM):
             for ctx, resp in zip(contexts, first_responses)
         ]
         return self._generate_responses(second_contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
+    @torch.inference_mode()
+    def agent3(
+        self, contexts: List[str], first_responses: List[str], second_responses: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
+    ) -> List[str]:
+        def _build_agent3_context(original_context: str, first_response: str, second_response: str) -> str:
+            return (
+                "Write a solution to the following problem and make sure that it passes the tests. "
+                "These are two previous responses for reference: ```python\n{first_resp}\n```\n ```python\n{second_resp}\n```\n"
+                "This is the problem: ```python\n{ctx}\n```"
+            ).format(first_resp=first_response, second_resp=second_response, ctx=original_context)
+        
+        third_contexts = [
+            _build_agent3_context(ctx, first_resp, second_resp)
+            for ctx, first_resp, second_resp in zip(contexts, first_responses, second_responses)
+        ]
+        return self._generate_responses(third_contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
+    @torch.inference_mode()
+    def summarizer(
+        self, contexts: List[str], first_responses: List[str], second_responses: List[str], third_responses: List[str], max_ctx_len: int, max_gen_toks: int, until: List[str], kwargs: Dict[str, Any],
+    ) -> List[str]:
+        def _build_summarizer_context(original_context: str, first_response: str, second_response: str, third_response: str) -> str:
+            return (
+                "Conclude a solution to the following problem and make sure that it passes the tests "
+                "based the answers from the three thinkers: ```python\n{first_resp}\n``` ```python\n{second_resp}\n``` ```python\n{third_resp}\n```\n"
+                "This is the problem: ```python\n{ctx}\n```"
+            ).format(first_resp=first_response, second_resp=second_response, third_resp=third_response, ctx=original_context)
+        
+        summarize_contexts = [
+            _build_summarizer_context(ctx, first_resp, second_resp, third_resp)
+            for ctx, first_resp, second_resp, third_resp in zip(contexts, first_responses, second_responses, third_responses)
+        ]
+        return self._generate_responses(summarize_contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
@@ -372,14 +407,17 @@ class _LLMEvalWrapper(HFLM):
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
 
+            print("================================ Multi-Agent Evaluation Start ================================")
             first_responses = self.agent1(contexts, max_ctx_len, max_gen_toks, until, kwargs)
             second_responses = self.agent2(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            third_responses = self.agent3(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            final_summary = self.summarizer(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
             # === final ===
-            for resp, context in zip(second_responses, contexts):
-                res.append(resp)
+            for s, context in zip(final_summary, contexts):
+                res.append(s)
 
-                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), resp)
+                self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
                 pbar.update(1)
         # reorder this group of results back to original unsorted form
         res = re_ords.get_original(res)
