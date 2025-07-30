@@ -25,7 +25,7 @@ from lm_eval.evaluator_utils import (
     get_task_list,
 )
 
-from torchtune._my_evaluator import my_evaluate
+from lm_eval.evaluator import evaluate
 from lm_eval.models.hf_vlms import HFMultimodalLM
 from lm_eval.models.huggingface import HFLM
 from lm_eval.tasks import get_task_dict, TaskManager
@@ -557,7 +557,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         self.logger.info(f"Running evaluation on the following tasks: {self.tasks}")
         self.logger.info(task_dict)
         self.logger.info(self.apply_chat_template)
-        output = my_evaluate(
+        output = evaluate(
             self.eleuther_model_wrapper,
             task_dict,
             apply_chat_template=self.apply_chat_template,
