@@ -612,13 +612,26 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         # Extract results from the 'output' dictionary
         result_rows = self._extract_results_from_output(output)
 
+        # Create a mapping from doc_id to pass@1 result for each task
+        correctness_map = {}
+        if "samples" in output:
+            for task_name, task_samples in output["samples"].items():
+                for sample in task_samples:
+                    doc_id = sample["doc_id"]
+                    # Use the 'pass@1' metric to determine correctness
+                    is_correct = bool(sample.get("pass@1", 0.0))
+                    correctness_map[(task_name, doc_id)] = is_correct
+
         # Create a DataFrame for the overview table
         overview_data = []
         for i, trace in enumerate(traces):
-            task_id = f"{trace.get('task', 'unknown')}_{trace.get('request_index', i)}"
+            task_name = trace.get('task', 'unknown')
+            doc_id = trace.get('request_index', i)
+            task_id = f"{task_name}_{doc_id}"
             function_name = self._extract_function_name(trace['prompt']) or "unknown"
-            # Use the final response's correctness if available, otherwise default to ❌
-            is_correct = "✅" if trace.get("pass", False) else "❌"
+            # Look up the correctness from the map
+            is_correct = correctness_map.get((task_name, doc_id), False)
+            emoji = "✅" if is_correct else "❌"
 
             agents = ["agent1", "agent2", "agent3", "summarizer"]
             total_tokens = [trace[agent]["input_tokens"] + trace[agent]["output_tokens"] for agent in agents]
@@ -629,7 +642,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             overview_data.append({
                 "Task ID": task_id,
                 "Function": function_name,
-                "Correct": is_correct,
+                "Correct": emoji,
                 "Tokens (A1/A2/A3/S)": f"{total_tokens[0]}/{total_tokens[1]}/{total_tokens[2]}/{total_tokens[3]}",
                 "Time (A1/A2/A3/S)": f"{times[0]:.2f}/{times[1]:.2f}/{times[2]:.2f}/{times[3]:.2f}",
                 "Overall Tokens": overall_tokens,
@@ -642,7 +655,13 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         jsonl_path = os.path.join(output_dir, "detailed_results.jsonl")
         with open(jsonl_path, "w", encoding="utf-8") as f:
             for trace in traces:
-                f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+                # Optionally, add the 'correct' field to the JSON trace for completeness
+                task_name = trace.get('task', 'unknown')
+                doc_id = trace.get('request_index', i)
+                is_correct = correctness_map.get((task_name, doc_id), False)
+                trace_with_correct = trace.copy()
+                trace_with_correct["correct"] = is_correct
+                f.write(json.dumps(trace_with_correct, ensure_ascii=False) + "\n")
         self.logger.info(f"Saved detailed results to {jsonl_path}")
 
         # ==================== Step 3: Write Markdown ====================
@@ -674,12 +693,16 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             # --- Section 4: Detailed Case Analysis ---
             f.write("## 🔍 Detailed Case Analysis\n")
             for i, trace in enumerate(traces):
-                task_id = f"{trace.get('task', 'unknown')}_{trace.get('request_index', i)}"
+                task_name = trace.get('task', 'unknown')
+                doc_id = trace.get('request_index', i)
+                task_id = f"{task_name}_{doc_id}"
                 function_name = self._extract_function_name(trace['prompt']) or "unknown"
-                is_correct = "✅" if trace.get("pass", False) else "❌"
+                # Look up the correctness from the map
+                is_correct = correctness_map.get((task_name, doc_id), False)
+                emoji = "✅" if is_correct else "❌"
 
                 # Write the main header for the test case
-                f.write(f"### {task_id} - `{function_name}` {is_correct}\n")
+                f.write(f"### {task_id} - `{function_name}` {emoji}\n")
                 # Write the stats for all agents on the same line
                 agents = ["agent1", "agent2", "agent3", "summarizer"]
                 stats_parts = []
@@ -699,7 +722,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
                 for agent in agents:
                     data = trace[agent]
                     f.write(f"<details>\n")
-                    f.write(f"<summary> {agent.upper()} -- Input Tokens: {data['input_tokens']}, Output Tokens: {data['output_tokens']}, Time: {data['total_time']:.2f}s\n</summary>\n\n")
+                    f.write(f"<summary>{agent.upper()} -- Input Tokens: {data['input_tokens']}, Output Tokens: {data['output_tokens']}, Time: {data['total_time']:.2f}s</summary>\n\n")
                     f.write(f"```python\n{data['response']}\n```\n")
                     f.write(f"</details>\n\n")
 
@@ -740,6 +763,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
                 f"Max memory allocated: {torch_device.max_memory_allocated() / 1e9:.02f} GB"
             )
         # Log the table for reference
+        # print(output)
         formatted_output = make_table(output)
         self.logger.info(f"\n{formatted_output}\n")
 
