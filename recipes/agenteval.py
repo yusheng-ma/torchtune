@@ -322,6 +322,7 @@ class _LLMEvalWrapper(HFLM):
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
         res = []
+        traces = []
         def _collate(req: Tuple[str, dict]):
             toks = self.tok_encode(req[0])
             return -len(toks), req[0]
@@ -384,12 +385,15 @@ class _LLMEvalWrapper(HFLM):
 
             # Run the multi-agent process and collect traces
             first_responses, first_traces = self.agent1_with_trace(contexts, max_ctx_len, max_gen_toks, until, kwargs)
-            second_responses, second_traces = self.agent2_with_trace(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
-            third_responses, third_traces = self.agent3_with_trace(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
-            final_summary, summarizer_traces = self.summarizer_with_trace(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            # second_responses, second_traces = self.agent2_with_trace(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            # third_responses, third_traces = self.agent3_with_trace(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            # final_summary, summarizer_traces = self.summarizer_with_trace(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            second_responses, second_traces = first_responses, first_traces
+            third_responses, third_traces = first_responses, first_traces
+            final_summary, summarizer_traces = first_responses, first_traces
 
             # Build trace for the current batch
-            batch_traces = []
+            # batch_traces = []
             for i, context in enumerate(contexts):
                 trace = {
                     "task": requests[i].task_name if hasattr(requests[i], 'task_name') else "unknown",
@@ -433,11 +437,12 @@ class _LLMEvalWrapper(HFLM):
                     },
                     "final_response": final_summary[i]
                 }
-                batch_traces.append(trace)
+                # batch_traces.append(trace)
+                traces.append(trace)
 
             # Reorder the batch traces to the original order and add to the global list
-            original_order_traces = re_ords.get_original(batch_traces)
-            self.eval_traces.extend(original_order_traces)
+            # original_order_traces = re_ords.get_original(batch_traces)
+            # self.eval_traces.extend(original_order_traces)
 
             # Append final responses for the harness
             for s, context in zip(final_summary, contexts):
@@ -445,6 +450,10 @@ class _LLMEvalWrapper(HFLM):
                 self.cache_hook.add_partial("generate_until", (context, gen_kwargs), s)
                 pbar.update(1)
 
+        self.eval_traces = re_ords.get_original(traces)
+
+        res = re_ords.get_original(res)
+        
         pbar.close()
         return res
 
@@ -490,6 +499,8 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         self.top_k = cfg.get("top_k", 50)
         # Extract model name from checkpoint_dir
         self.model_name = self._extract_model_name(cfg.checkpointer.checkpoint_dir)
+        self.output_jsonl_name = cfg.get("output_jsonl_name", "results.jsonl")
+        self.output_markdown_name = cfg.get("output_markdown_name", "report.md")
 
     def _extract_model_name(self, checkpoint_dir: str) -> str:
         """Extract model name from the checkpoint directory path."""
@@ -652,7 +663,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
 
         # ==================== Step 2: Write JSONL ====================
         # Output 1: JSONL (for analysis)
-        jsonl_path = os.path.join(output_dir, "detailed_results.jsonl")
+        jsonl_path = os.path.join(output_dir, self.output_jsonl_name)
         with open(jsonl_path, "w", encoding="utf-8") as f:
             for trace in traces:
                 # Optionally, add the 'correct' field to the JSON trace for completeness
@@ -665,7 +676,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         self.logger.info(f"Saved detailed results to {jsonl_path}")
 
         # ==================== Step 3: Write Markdown ====================
-        md_path = os.path.join(output_dir, "detailed_report.md")
+        md_path = os.path.join(output_dir, self.output_markdown_name)
         with open(md_path, "w", encoding="utf-8") as f:
             # --- Section 1: Header and Model Info ---
             f.write("# 📊 Multi-Agent Evaluation Report\n\n")
