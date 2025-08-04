@@ -232,7 +232,7 @@ class _LLMEvalWrapper(HFLM):
         gen_time = time.time() - start_gen
 
         cont_toks_list = cont.tolist()
-        input_lens = [len(x) for x in self.tok_batch_encode(contexts)[0]]
+        input_lens = [len(x) for x in context_enc]
 
         # c. decode & postprocess
         start_post = time.time()
@@ -671,6 +671,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             f.write("# 📊 Multi-Agent Evaluation Report\n\n")
             f.write(f"**Model**: `{self.model_name}`\n")
             f.write(f"**Tasks**: `{', '.join(self.tasks)}`\n")
+            f.write(f"**Batch Size**: `{self.batch_size}`\n")
             f.write(f"**Sample Limit**: `{self.limit}`\n\n")
 
             # --- Section 2: Results Table ---
