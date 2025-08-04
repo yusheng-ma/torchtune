@@ -246,7 +246,7 @@ class _LLMEvalWrapper(HFLM):
             for term in until:
                 if term and term in s:
                     s = s.split(term)[0]
-            responses.append(s.strip())
+            responses.append(s)
 
             total_time = pre_time + gen_time + (time.time() - start_post) / len(contexts)
             trace = {
@@ -397,7 +397,7 @@ class _LLMEvalWrapper(HFLM):
             for i, context in enumerate(contexts):
                 trace = {
                     "task": requests[i].task_name if hasattr(requests[i], 'task_name') else "unknown",
-                    "request_index": requests[i].doc_id if hasattr(requests[i], 'doc_id') else i,
+                    # "request_index": requests[i].doc_id if hasattr(requests[i], 'doc_id') else i,
                     "prompt": context,
                     "agent1": {
                         "response": first_responses[i],
@@ -637,7 +637,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
         overview_data = []
         for i, trace in enumerate(traces):
             task_name = trace.get('task', 'unknown')
-            doc_id = trace.get('request_index', i)
+            doc_id = i
             task_id = f"{task_name}_{doc_id}"
             function_name = self._extract_function_name(trace['prompt']) or "unknown"
             # Look up the correctness from the map
