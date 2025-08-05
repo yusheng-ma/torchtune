@@ -75,6 +75,7 @@ class _LLMEvalWrapper(HFLM):
         batch_size: int = 8,
         dtype: torch.dtype = torch.float32,
         enable_kv_cache: bool = True,
+        model_name: str,
     ):
         super().__init__(pretrained="gpt2", device=str(device))
         self._model = model
@@ -83,6 +84,7 @@ class _LLMEvalWrapper(HFLM):
         self._batch_size = batch_size
         self._dtype = dtype
         self._enable_kv_cache = enable_kv_cache
+        self.model_name = model_name
         # Add a list to store evaluation traces
         self.eval_traces = []
 
@@ -246,6 +248,9 @@ class _LLMEvalWrapper(HFLM):
             for term in until:
                 if term and term in s:
                     s = s.split(term)[0]
+            if self.model_name == "Mistral-7B-Instruct-v0.2":
+                print("mistral add space")
+                s = " " + s
             responses.append(s)
 
             total_time = pre_time + gen_time + (time.time() - start_post) / len(contexts)
@@ -570,6 +575,7 @@ class EleutherEvalRecipe(EvalRecipeInterface):
             batch_size=self.batch_size,
             dtype=self.dtype,
             enable_kv_cache=self.enable_kv_cache,
+            model_name = self.model_name,
         )
 
     def _extract_results_from_output(self, output: Dict[str, Any]) -> List[Dict[str, str]]:
