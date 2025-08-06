@@ -49,6 +49,7 @@ from tqdm import tqdm
 from lm_eval.api.instance import Instance
 from lm_eval.models.utils import Collator, handle_stop_sequences
 import torch
+from torchtune.modules import delete_kv_caches
 
 class _LLMEvalWrapper(HFLM):
     """An EvalWrapper for EleutherAI's eval harness based on gpt-fast's
@@ -172,22 +173,22 @@ class _LLMEvalWrapper(HFLM):
             (0, 0, 0, self._batch_size - bsz),
             value=self._tokenizer.eos_id,
         )
-        with local_kv_cache(
-            self.model,
-            batch_size=self.batch_size,
-            device=self.device,
-            dtype=self._dtype,
-            decoder_max_seq_len=self.max_length,
-        ):
-            toks, _ = generate(
-                self.model,
-                maybe_padded_context,
-                max_generated_tokens=self.max_gen_toks,
-                temperature=temperature,
-                top_k=None,
-                pad_id=self._tokenizer.pad_id,
-                stop_tokens=self._tokenizer.stop_tokens,
+        with self.device:
+            self._model.setup_caches(
+                batch_size=self.batch_size,
+                dtype=self._dtype,
+                decoder_max_seq_len=self.max_length,
             )
+        toks, _ = generate(
+            self.model,
+            maybe_padded_context,
+            max_generated_tokens=self.max_gen_toks,
+            temperature=temperature,
+            top_k=None,
+            pad_id=self._tokenizer.pad_id,
+            stop_tokens=self._tokenizer.stop_tokens,
+        )
+        delete_kv_caches(self.model)
         return toks[:bsz]
 
     @torch.inference_mode()
@@ -245,6 +246,7 @@ class _LLMEvalWrapper(HFLM):
             else:
                 output_toks = cont_toks
             s = self.tok_decode(output_toks)
+            # print(until)
             for term in until:
                 if term and term in s:
                     s = s.split(term)[0]
@@ -279,14 +281,14 @@ class _LLMEvalWrapper(HFLM):
         def _build_agent2_context(original_context: str, first_response: str) -> str:
             return (
                 "Write a solution to the following problem and make sure that it passes the tests. "
-                "This is the response from other thinkers: ```python\n{resp}\n``` for your reference.\n"
-                "This is the problem: ```python\n{ctx}\n```"
+                "This is the response from other thinkers: \n{resp}\n for your reference.\n"
+                "This is the problem: \n{ctx}"
             ).format(resp=first_response, ctx=original_context)
         second_contexts = [
             _build_agent2_context(ctx, resp)
             for ctx, resp in zip(contexts, first_responses)
         ]
-        return self._generate_responses_with_trace(contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
         return self._generate_responses_with_trace(second_contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     @torch.inference_mode()
@@ -296,14 +298,14 @@ class _LLMEvalWrapper(HFLM):
         def _build_agent3_context(original_context: str, first_response: str, second_response: str) -> str:
             return (
                 "Write a solution to the following problem and make sure that it passes the tests. "
-                "These are two previous responses for reference: ```python\n{first_resp}\n```\n ```python\n{second_resp}\n```\n"
-                "This is the problem: ```python\n{ctx}\n```"
+                "These are two previous responses for reference: \n{first_resp}\n\n\n{second_resp}\n"
+                "This is the problem: \n{ctx}"
             ).format(first_resp=first_response, second_resp=second_response, ctx=original_context)
         third_contexts = [
             _build_agent3_context(ctx, first_resp, second_resp)
             for ctx, first_resp, second_resp in zip(contexts, first_responses, second_responses)
         ]
-        return self._generate_responses_with_trace(contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
         return self._generate_responses_with_trace(third_contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     @torch.inference_mode()
@@ -313,14 +315,14 @@ class _LLMEvalWrapper(HFLM):
         def _build_summarizer_context(original_context: str, first_response: str, second_response: str, third_response: str) -> str:
             return (
                 "Conclude a solution to the following problem and make sure that it passes the tests "
-                "based the answers from the three thinkers: ```python\n{first_resp}\n``` ```python\n{second_resp}\n``` ```python\n{third_resp}\n```\n"
-                "This is the problem: ```python\n{ctx}\n```"
+                "based the answers from the three thinkers: \n{first_resp}\n\n\n{second_resp}\n\n\n{third_resp}\n"
+                "This is the problem: \n{ctx}"
             ).format(first_resp=first_response, second_resp=second_response, third_resp=third_response, ctx=original_context)
         summarize_contexts = [
             _build_summarizer_context(ctx, first_resp, second_resp, third_resp)
             for ctx, first_resp, second_resp, third_resp in zip(contexts, first_responses, second_responses, third_responses)
         ]
-        return self._generate_responses_with_trace(contexts, max_ctx_len, max_gen_toks, until, kwargs)
+
         return self._generate_responses_with_trace(summarize_contexts, max_ctx_len, max_gen_toks, until, kwargs)
 
     def generate_until(
@@ -390,12 +392,9 @@ class _LLMEvalWrapper(HFLM):
 
             # Run the multi-agent process and collect traces
             first_responses, first_traces = self.agent1_with_trace(contexts, max_ctx_len, max_gen_toks, until, kwargs)
-            # second_responses, second_traces = self.agent2_with_trace(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
-            # third_responses, third_traces = self.agent3_with_trace(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
-            # final_summary, summarizer_traces = self.summarizer_with_trace(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
-            second_responses, second_traces = first_responses, first_traces
-            third_responses, third_traces = first_responses, first_traces
-            final_summary, summarizer_traces = first_responses, first_traces
+            second_responses, second_traces = self.agent2_with_trace(contexts, first_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            third_responses, third_traces = self.agent3_with_trace(contexts, first_responses, second_responses, max_ctx_len, max_gen_toks, until, kwargs)
+            final_summary, summarizer_traces = self.summarizer_with_trace(contexts, first_responses, second_responses, third_responses, max_ctx_len, max_gen_toks, until, kwargs)
 
             # Build trace for the current batch
             # batch_traces = []
